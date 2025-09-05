@@ -171,17 +171,20 @@ parseFile <- function(files, fileLabels, genome) {
 #' @importFrom data.table as.data.table .N ':='
 #' @importFrom rlang .data
 #' @importFrom S4Vectors 'metadata<-'
-buildSummarizedExperiment <- function(promoterAnnotation, 
-                                        files, fileLabels, fileType, 
-                                        genome, ncores) {
-    promoterCounts <- calculatePromoterReadCounts(promoterAnnotation, 
-                                                    files, fileLabels, fileType, 
-                                                    genome, ncores)
+buildSummarizedExperiment_edited <- function(promoterCounts, promoterAnnotation, 
+                                     sample_info, 
+                                     sample_col = "sample_id", 
+                                     condition_col = "condition") {
+
+    # Extract file labels and conditions from sample_info
+    fileLabels <- sample_info[[sample_col]]
+    condition <- if (condition_col %in% colnames(sample_info)) sample_info[[condition_col]] else NULL
     normalizedPromoterCounts <- normalizePromoterReadCounts(promoterCounts)
     absolutePromoterActivity <- getAbsolutePromoterActivity(
                                                     normalizedPromoterCounts, 
                                                     promoterAnnotation)
     geneExpression <- getGeneExpression(absolutePromoterActivity)
+    rownames(geneExpression) <- rownames(promoterCounts)
     relativePromoterActivity <- getRelativePromoterActivity(
                                                     absolutePromoterActivity, 
                                                     geneExpression)
@@ -203,15 +206,32 @@ buildSummarizedExperiment <- function(promoterAnnotation,
     promoterPosition <- geneId <- strand <- NULL
     promoterCoordinates[, promoterPosition := ifelse(strand == '+', seq_len(.N), 
                                                 rev(seq_len(.N))), by=geneId]
+    # Filter promoter coordinates to match filtered promoters
+    filtered_promoter_ids <- absolutePromoterActivity$promoterId
+    promoterCoords_filtered <- promoterCoordinates[promoterCoordinates$promoterId %in% filtered_promoter_ids, ]
+  
     ## Build row data
     rowData(result) <- data.frame(
-                        absolutePromoterActivity[,c('promoterId', 'geneId')], 
-                        promoterCoordinates[,c("seqnames","start", "strand",
-                                    "internalPromoter", "promoterPosition")])
+        absolutePromoterActivity[, c('promoterId', 'geneId')], 
+        promoterCoords_filtered[match(absolutePromoterActivity$promoterId, 
+                                     promoterCoords_filtered$promoterId), 
+                               c("seqnames", "start", "strand", 
+                                 "internalPromoter", "promoterPosition")]
+    )
     transcriptByPromoter <- split(promoterIdMapping$transcriptName, 
                                 promoterIdMapping$promoterId)
     rowData(result)$txId <- transcriptByPromoter[match(rowData(result)$promoterId, 
                                                 names(transcriptByPromoter))]
+    # Summarize across conditions if provided
+    if (!is.null(condition)) {
+        if (length(condition) != length(fileLabels)) {
+            warning('Condition length does not match sample length. 
+                    Returning results not summarized across conditions.')
+            return(result)
+        } else {
+            result <- summarizeAcrossCondition(result, condition) 
+        }
+    } 
     return(result)
 }
 
