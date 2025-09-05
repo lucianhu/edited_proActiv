@@ -1,220 +1,224 @@
-#' Estimates promoter counts and activity in a single command
-#'
-#' @param files A character vector. The list of input files for 
-#'   which the junction read counts will be calculated
-#' @param promoterAnnotation A PromoterAnnotation object containing the
-#'   intron ranges, promoter coordinates and the promoter id mapping
-#' @param fileLabels A character vector. The labels of input files 
-#'   for which the junction read counts will be calculated. These labels will be 
-#'   used as column names for each output data.frame object. If not provided,
-#'   filenames will be used as labels. Defaults to NULL
-#' @param condition A character vector. The condition to which each sample
-#'   belong to. Must correspond to the order of the files. If supplied, 
-#'   results are summarized by condition. Defaults to NULL
-#' @param genome A character. Genome version. Must be specified if input file
-#'   type is a BAM file. Defaults to NULL
-#' @param ncores A numeric value. The number of cores to be used for 
-#'   counting junction reads. Defaults to 1 (no parallelization). This parameter 
-#'   will be used as an argument to BiocParallel::bplapply
-#' 
-#'
-#' @export
-#' @return A SummarizedExperiment object with assays giving promoter counts 
-#'   and activity with gene expression. rowData contains
-#'   promoter metadata and absolute promoter activity summarized across
-#'   conditions (if condition is provided)
-#' 
-#' @examples
-#' 
-#' files <- list.files(system.file('extdata/vignette/junctions', 
-#'                        package = 'proActiv'), 
-#'                        full.names = TRUE, pattern = 'replicate5')
-#' promoterAnnotation <- promoterAnnotation.gencode.v34.subset
-#' result <- proActiv(files = files,
-#'                        promoterAnnotation  = promoterAnnotation,
-#'                        condition = rep(c('A549', 'HepG2'), each=1),
-#'                        fileLabels = NULL,
-#'                        ncores = 1)
-#'                            
-proActiv <- function(files, promoterAnnotation, fileLabels = NULL, 
-                    condition = NULL, genome = NULL, ncores = 1) {
+prepare_promoter_annotation <- function(gtf, sqlite) {
+  # Check if GTF file exists
+  if (!file.exists(gtf)) {
+    stop(paste("GTF file not found:", gtf))
+  }
+  
+  # Create or load TxDb object
+  if (!file.exists(sqlite)) {
+    txdb <- txdbmaker::makeTxDbFromGFF(
+      gtf, 
+      format = "gtf", 
+      dataSource = "gencode", 
+      organism = "Homo sapiens"
+    )
+    saveDb(txdb, file = sqlite)
+  } else {
+    txdb <- loadDb(sqlite)
+  }
+  
+  # Prepare promoter annotation
+  promoterAnnotation <- proActiv::preparePromoterAnnotation(
+    txdb = txdb, 
+    species = "Homo_sapiens"
+  )
+  
+  return(promoterAnnotation)
+}
+
+process_salmon_data <- function(input_dir, promoterAnnotation, sample_info, 
+                               condition_col = "condition", 
+                               sample_col = "sample_id",
+                               apply_filter = TRUE, 
+                               min_count = 10, min_prop = 0.7) {
+
+  # Find quant.sf files
+  quant.files <- list.files(input_dir, pattern = "quant.sf", 
+                            recursive = TRUE, full.names = TRUE)
+  
+  if (length(quant.files) == 0) {
+    stop("No quant.sf files found in ", input_dir)
+  }
+  
+  quant.dirs <- unique(dirname(quant.files))
+  message("Found ", length(quant.dirs), " Salmon quantification directories")
+  
+  # Import using catchSalmon
+  catch <- edgeR::catchSalmon(paths = quant.dirs)
+  
+  # Prepare count matrix
+  if (!"Overdispersion" %in% colnames(catch$annotation)) {
+    count_matrix <- catch$counts
+  } else {
+    count_matrix <- catch$counts / catch$annotation$Overdispersion
+  }
+  
+  # Clean column names
+  colnames(count_matrix) <- gsub(".*/", "", quant.dirs)
+  
+  # Create data frame for merging
+  count_df <- data.frame(
+    transcriptName = rownames(count_matrix),
+    count_matrix,
+    stringsAsFactors = FALSE
+  )
+  
+  # Get promoter mapping
+  promoterIdMap <- promoterIdMapping(promoterAnnotation)
+  
+  # Merge with promoter annotation
+  transcripts_matched <- sum(count_df$transcriptName %in% promoterIdMap$transcriptName)
+  message("Direct transcript ID matches: ", transcripts_matched, "/", nrow(count_df))
+  
+  merged_data <- merge(count_df, promoterIdMap, by = "transcriptName", all.x = FALSE)
+  
+  # Identify sample columns
+  sample_cols <- intersect(colnames(merged_data), sample_info[[sample_col]])
+  
+  if (length(sample_cols) == 0) {
+    sample_cols <- colnames(count_matrix)
+  }
+  
+  message("Using ", length(sample_cols), " samples for analysis")
+  
+  # Group by promoter
+  merged_dt <- as.data.table(merged_data)
+  promoter_data <- merged_dt[,
+    lapply(.SD, sum, na.rm = TRUE),
+    by = .(promoterId, geneId),
+    .SDcols = sample_cols
+  ]
+  promoter_data <- as.data.frame(promoter_data)
+  rownames(promoter_data) <- promoter_data$promoterId
+  
+  # Create DGEList
+  count_matrix_final <- as.matrix(promoter_data[, sample_cols])
+  dge_list <- edgeR::DGEList(counts = count_matrix_final)
+  
+  # Apply filtering if requested
+  if (apply_filter) {
+    message("Applying edgeR filtering")
     
-    parser <- parseFile(files, fileLabels, genome)
-    fileLabels <- parser$fileLabels
-    fileType <- parser$fileType
+    if (condition_col %in% colnames(sample_info)) {
+      design <- model.matrix(as.formula(paste("~", condition_col)), data = sample_info)
+    } else {
+      design <- model.matrix(~ 1, data = sample_info)
+    }
     
-    result <- buildSummarizedExperiment(promoterAnnotation, files, fileLabels,
-                                        fileType, genome, ncores)
+    keep <- edgeR::filterByExpr(dge_list, design = design, 
+                               min.count = min_count, min.prop = min_prop)
+    message("Filtering: kept ", sum(keep), "/", length(keep), " promoters")
     
+    dge_list <- dge_list[keep, , keep.lib.sizes = FALSE]
+  }
+  
+  promoterCounts <- round(dge_list$counts)
+  
+  # Quality control summary
+  cat("\n=== FINAL SUMMARY ===\n")
+  cat("Original transcripts:", nrow(count_df), "\n")
+  cat("Transcripts with promoter annotation:", nrow(merged_data), "\n")
+  cat("Unique promoters after aggregation:", nrow(promoter_data), "\n")
+  cat("Final promoters:", nrow(promoterCounts), "\n")
+  cat("Samples analyzed:", ncol(promoterCounts), "\n")
+  
+  cat("\n=== Quality Control Summary ===\n")
+  cat("Promoters with zero counts:", sum(rowSums(promoterCounts) == 0), "\n")
+  cat("Promoters with counts > 10:", sum(apply(promoterCounts, 1, function(x) any(x > 10))), "\n")
+  cat("Median counts per promoter:", median(rowSums(promoterCounts)), "\n")
+  cat("Median counts per sample:", median(colSums(promoterCounts)), "\n")
+  
+  return(promoterCounts)
+}
+
+buildSummarizedExperiment_edited <- function(promoterCounts, promoterAnnotation, 
+                                     sample_info, 
+                                     sample_col = "sample_id", 
+                                     condition_col = "condition") {
+
+    # Extract file labels and conditions from sample_info
+    fileLabels <- sample_info[[sample_col]]
+    condition <- if (condition_col %in% colnames(sample_info)) sample_info[[condition_col]] else NULL
+    
+    # Normalize promoter counts
+    normalizedPromoterCounts <- normalizePromoterReadCounts(promoterCounts)
+    
+    # Get absolute promoter activity
+    absolutePromoterActivity <- getAbsolutePromoterActivity(
+        normalizedPromoterCounts, 
+        promoterAnnotation
+    )
+    
+    # Get gene expression
+    geneExpression <- getGeneExpression(absolutePromoterActivity)
+    rownames(geneExpression) <- rownames(promoterCounts)
+    
+    # Get relative promoter activity
+    relativePromoterActivity <- getRelativePromoterActivity(
+        absolutePromoterActivity, 
+        geneExpression
+    )
+    
+    # Create SummarizedExperiment
+    result <- SummarizedExperiment(assays = list(
+        promoterCounts = promoterCounts,
+        normalizedPromoterCounts = normalizedPromoterCounts,
+        absolutePromoterActivity = absolutePromoterActivity[, fileLabels, drop = FALSE],
+        relativePromoterActivity = relativePromoterActivity[, fileLabels, drop = FALSE],
+        geneExpression = geneExpression[, fileLabels, drop = FALSE]
+    ))
+    
+    message('Calculating positions of promoters...')
+    
+    # Get promoter coordinates and mapping
+    promoterCoords <- promoterCoordinates(promoterAnnotation)
+    promoterIdMap <- promoterIdMapping(promoterAnnotation)
+    
+    # Add geneId to coordinates
+    promoterCoords$geneId <- promoterIdMap$geneId[match(
+        promoterCoords$promoterId, promoterIdMap$promoterId
+    )]
+    
+    # Calculate promoter positions
+    promoterCoords <- as.data.table(promoterCoords)
+    promoterPosition <- geneId <- strand <- NULL
+    promoterCoords[, promoterPosition := ifelse(strand == '+', seq_len(.N), 
+                                               rev(seq_len(.N))), by = geneId]
+    
+    # Filter promoter coordinates to match filtered promoters
+    filtered_promoter_ids <- absolutePromoterActivity$promoterId
+    promoterCoords_filtered <- promoterCoords[promoterCoords$promoterId %in% filtered_promoter_ids, ]
+    
+    # Build row data
+    rowData(result) <- data.frame(
+        absolutePromoterActivity[, c('promoterId', 'geneId')], 
+        promoterCoords_filtered[match(absolutePromoterActivity$promoterId, 
+                                     promoterCoords_filtered$promoterId), 
+                               c("seqnames", "start", "strand", 
+                                 "internalPromoter", "promoterPosition")]
+    )
+    
+    # Add transcript information
+    transcriptByPromoter <- split(promoterIdMap$transcriptName, 
+                                 promoterIdMap$promoterId)
+    rowData(result)$txId <- transcriptByPromoter[match(
+        rowData(result)$promoterId, 
+        names(transcriptByPromoter)
+    )]
+    
+    # Summarize across conditions if provided
     if (!is.null(condition)) {
-        if (length(condition) != length(files)) {
-            warning('Condition argument is invalid. 
-                Please ensure a 1-1 map between each condition and each file.
-                Returning results not summarized across conditions.')
+        if (length(condition) != length(fileLabels)) {
+            warning('Condition length does not match sample length. 
+                    Returning results not summarized across conditions.')
             return(result)
         } else {
             result <- summarizeAcrossCondition(result, condition) 
         }
     }
-    return(result) 
-}
-
-#' Integrate multiple proActiv runs 
-#'
-#' @param res1 A summarizedExperiment object returned by proActiv
-#' @param res2 A summarizedExperiment object returned by proActiv
-#' @param ... Additional summarizedExperiment objects returned by proActiv
-#' @param promoterAnnotation Promoter annotation object used to create 
-#'   proActiv runs
-#' @param renormalize Whether to renormalize counts after merging. Defaults to 
-#'   TRUE
-#'
-#' @export
-#' @return A SummarizedExperiment object with assays giving promoter counts 
-#'   and activity with gene expression. rowData contains
-#'   promoter metadata and absolute promoter activity summarized across
-#'   conditions (if condition is provided)
-#' 
-#' @examples
-#' f1 <- list.files(system.file('extdata/vignette/junctions', 
-#'                              package = 'proActiv'), 
-#'                  full.names = TRUE, pattern = 'A549')
-#' f2 <- list.files(system.file('extdata/vignette/junctions', 
-#'                              package = 'proActiv'), 
-#'                  full.names = TRUE, pattern = 'HepG2')
-#' promoterAnnotation <- promoterAnnotation.gencode.v34.subset
-#' res1 <- proActiv(files = f1, promoterAnnotation  = promoterAnnotation,
-#'                  condition = rep('A549',3))
-#' res2 <- proActiv(files = f2, promoterAnnotation = promoterAnnotation,
-#'                  condition = rep('HepG2',3))
-#' res <- integrateProactiv(res1, res2, promoterAnnotation = promoterAnnotation)
-#'
-#' @importFrom SummarizedExperiment assays `assays<-` cbind rowData `rowData<-`
-integrateProactiv <- function(res1, res2, ..., 
-                              promoterAnnotation,
-                              renormalize = TRUE) {
-    combined <- cbind(res1, res2, ...)
-    if (renormalize) {
-        promoterCounts <- assays(combined)$promoterCounts
-        normalizedPromoterCounts <- normalizePromoterReadCounts(promoterCounts)
-        absolutePromoterActivity <- getAbsolutePromoterActivity(
-            normalizedPromoterCounts, promoterAnnotation)
-        
-        geneExpression <- getGeneExpression(absolutePromoterActivity)
-        relativePromoterActivity <- getRelativePromoterActivity(
-            absolutePromoterActivity, geneExpression)
-        
-        rownames(geneExpression) <- rownames(promoterCounts)
-        fileLabels <- combined$sampleName
-        assays(combined) <- list(promoterCounts = promoterCounts, 
-            normalizedPromoterCounts = normalizedPromoterCounts, 
-            absolutePromoterActivity = absolutePromoterActivity[, fileLabels, 
-                                                                drop=FALSE], 
-            relativePromoterActivity = relativePromoterActivity[, fileLabels, 
-                                                                drop=FALSE],
-            geneExpression = geneExpression[, fileLabels, drop=FALSE])    
-        
-        ## Settle rowData
-        rowData(combined) <- rowData(combined)[-grep("mean|class", 
-                                                colnames(rowData(combined)))]
-        combined <- summarizeAcrossCondition(combined, combined$condition)
-    }
-    return(combined)
-} 
-
-
-
-# Helper function to impute file labels and infer file type
-parseFile <- function(files, fileLabels, genome) {
-    checkFile <- file.exists(files)
-    if (any(!checkFile)) {
-        stop(paste0('Error: Please specify valid file paths. 
-                    The following file does not exist: ', files[!checkFile]))
-    }
     
-    if (is.null(fileLabels)) {
-        fileLabels <- make.names(tools::file_path_sans_ext(basename(files), 
-                                                            compression = TRUE),
-                                unique = TRUE)
-    }
-    
-    ext <- unique(tools::file_ext(files))
-    if (length(ext) != 1) {
-        stop("Error: More than one file type detected from given file path")
-    }
-    
-    if (ext == 'gz' | ext == 'bz2' | ext == 'xz'){
-        files.tmp <- gsub(paste0('\\.', ext), '', files)
-        ext <- unique(tools::file_ext(files.tmp))
-    }
-    
-    if (ext == 'bam') {
-        fileType <- 'bam'
-        if (is.null(genome)) {
-            stop('Error: Please specify genome.')
-        }
-    } else if (ext == 'bed') {
-        fileType <- 'tophat' 
-    } else if (ext == 'junctions' | ext == 'tab') {
-        fileType <- 'star'
-    } else {
-        stop('Invalid input files: Input must either be a BAM file (.bam), 
-            Tophat junctions file (.bed) or 
-            STAR junctions file (.junctions / .tab)')
-    }
-    parsed <- list(fileLabels = fileLabels, fileType = fileType) 
-    return(parsed)
-}
-
-# Call functions to get activity and build summarized experiment
-#' @importFrom SummarizedExperiment SummarizedExperiment 'rowData<-'
-#' @importFrom data.table as.data.table .N ':='
-#' @importFrom rlang .data
-#' @importFrom S4Vectors 'metadata<-'
-buildSummarizedExperiment <- function(promoterAnnotation, 
-                                        files, fileLabels, fileType, 
-                                        genome, ncores) {
-    promoterCounts <- calculatePromoterReadCounts(promoterAnnotation, 
-                                                    files, fileLabels, fileType, 
-                                                    genome, ncores)
-    normalizedPromoterCounts <- normalizePromoterReadCounts(promoterCounts)
-    absolutePromoterActivity <- getAbsolutePromoterActivity(
-                                                    normalizedPromoterCounts, 
-                                                    promoterAnnotation)
-    geneExpression <- getGeneExpression(absolutePromoterActivity)
-    relativePromoterActivity <- getRelativePromoterActivity(
-                                                    absolutePromoterActivity, 
-                                                    geneExpression)
-    result <- SummarizedExperiment(assays = list(
-            promoterCounts = promoterCounts,
-            normalizedPromoterCounts = normalizedPromoterCounts,
-            absolutePromoterActivity = absolutePromoterActivity[, 
-                                                    fileLabels, drop = FALSE],
-            relativePromoterActivity = relativePromoterActivity[, 
-                                                    fileLabels, drop = FALSE],
-            geneExpression = geneExpression[, fileLabels, drop = FALSE]))
-    
-    message('Calculating positions of promoters...')
-    promoterCoordinates <- promoterCoordinates(promoterAnnotation)
-    promoterIdMapping <- promoterIdMapping(promoterAnnotation)
-    promoterCoordinates$geneId <- promoterIdMapping$geneId[match(
-                promoterCoordinates$promoterId, promoterIdMapping$promoterId)]
-    promoterCoordinates <- as.data.table(promoterCoordinates)
-    promoterPosition <- geneId <- strand <- NULL
-    promoterCoordinates[, promoterPosition := ifelse(strand == '+', seq_len(.N), 
-                                                rev(seq_len(.N))), by=geneId]
-    ## Build row data
-    rowData(result) <- data.frame(
-                        absolutePromoterActivity[,c('promoterId', 'geneId')], 
-                        promoterCoordinates[,c("seqnames","start", "strand",
-                                    "internalPromoter", "promoterPosition")])
-    transcriptByPromoter <- split(promoterIdMapping$transcriptName, 
-                                promoterIdMapping$promoterId)
-    rowData(result)$txId <- transcriptByPromoter[match(rowData(result)$promoterId, 
-                                                names(transcriptByPromoter))]
     return(result)
 }
-
 
 # Helper function to summarize results across condition
 #' @importFrom S4Vectors DataFrame metadata
